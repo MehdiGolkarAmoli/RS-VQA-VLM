@@ -6,7 +6,7 @@ from streamlit_drawable_canvas import st_canvas
 import re
 from collections import Counter
 from dataclasses import dataclass
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -116,6 +116,9 @@ Important:
 - If it is a yes/no question, set needs_yes_no=true.
 - If it is a counting question, set task_type=counting and needs_detection=true.
 - If the user asks to show, draw, mark, highlight, or outline objects, set needs_visualization=true.
+- Treat cars/trucks/buses/vans as vehicle.
+- Treat sheds/houses/roofs/apartments as building when no more specific ontology class exists.
+- Treat lakes/ponds/rivers as water unless river is specifically the better target class.
 - Use the fixed ontology only.
 """
 
@@ -128,6 +131,18 @@ class Detection:
     target_class: str
     bbox: List[float]   # [x1, y1, x2, y2] normalized
     score: float
+    source: str = "detector"
+
+
+@dataclass
+class GroundingIntent:
+    selection_mode: Literal["all", "largest", "smallest", "main", "spatial", "largest_group"]
+    spatial_region: Optional[
+        Literal[
+            "north", "south", "east", "west", "left", "right", "center",
+            "northeast", "northwest", "southeast", "southwest"
+        ]
+    ] = None
 
 
 # ====================================================
@@ -152,6 +167,10 @@ def resize_for_display(image: Image.Image):
 
 def box_area(box):
     return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+def box_center(box):
+    return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
 
 
 def iou(box1, box2):
@@ -194,6 +213,14 @@ def normalize_target_classes(classes: List[str]) -> List[str]:
     out = []
     for c in classes:
         c = c.strip().lower().replace(" ", "_")
+        if c in {"car", "cars", "truck", "trucks", "bus", "buses", "van", "vans"}:
+            c = "vehicle"
+        elif c in {"house", "houses", "home", "homes", "shed", "sheds", "roof", "roofs"}:
+            c = "building"
+        elif c in {"farm", "farms", "field", "fields", "crop", "crops", "agricultural_land"}:
+            c = "farmland"
+        elif c in {"lake", "lakes", "pond", "ponds", "reservoir", "river"}:
+            c = "water"
         if c in ONTOLOGY and c not in out:
             out.append(c)
     return out
@@ -206,6 +233,142 @@ def detect_visual_intent(question: str) -> bool:
         "outline", "visualize", "display"
     ]
     return any(k in q for k in keywords)
+
+
+def extract_grounding_intent(question: str) -> GroundingIntent:
+    """Extract simple deterministic grounding constraints from the user question.
+
+    The router decides whether detection is needed; this helper decides which
+    detector boxes should be highlighted when the question asks for a subset
+    such as the largest object, the main area, or a directional region.
+    """
+    q = question.lower()
+
+    region_patterns = [
+        ("northeast", ["north east", "north-east", "northeast", "upper right", "top right"]),
+        ("northwest", ["north west", "north-west", "northwest", "upper left", "top left"]),
+        ("southeast", ["south east", "south-east", "southeast", "lower right", "bottom right"]),
+        ("southwest", ["south west", "south-west", "southwest", "lower left", "bottom left"]),
+        ("north", ["north", "northern", "top", "upper"]),
+        ("south", ["south", "southern", "bottom", "lower"]),
+        ("east", ["east", "eastern"]),
+        ("west", ["west", "western"]),
+        ("left", ["left"]),
+        ("right", ["right"]),
+        ("center", ["center", "central", "middle"]),
+    ]
+
+    spatial_region = None
+    for region, terms in region_patterns:
+        if any(term in q for term in terms):
+            spatial_region = region
+            break
+
+    if any(term in q for term in ["biggest group", "largest group", "main group", "cluster"]):
+        return GroundingIntent(selection_mode="largest_group", spatial_region=spatial_region)
+
+    if any(term in q for term in ["largest", "biggest"]):
+        return GroundingIntent(selection_mode="largest", spatial_region=spatial_region)
+
+    if any(term in q for term in ["smallest", "least large", "tiny"]):
+        return GroundingIntent(selection_mode="smallest", spatial_region=spatial_region)
+
+    if any(term in q for term in ["main", "primary", "dominant"]):
+        return GroundingIntent(selection_mode="main", spatial_region=spatial_region)
+
+    if spatial_region:
+        return GroundingIntent(selection_mode="spatial", spatial_region=spatial_region)
+
+    return GroundingIntent(selection_mode="all")
+
+
+def detection_in_region(det: Detection, region: str) -> bool:
+    cx, cy = box_center(det.bbox)
+    if region in {"north", "top"}:
+        return cy <= 0.5
+    if region in {"south", "bottom"}:
+        return cy >= 0.5
+    if region in {"west", "left"}:
+        return cx <= 0.5
+    if region in {"east", "right"}:
+        return cx >= 0.5
+    if region == "center":
+        return 0.25 <= cx <= 0.75 and 0.25 <= cy <= 0.75
+    if region == "northeast":
+        return cx >= 0.5 and cy <= 0.5
+    if region == "northwest":
+        return cx <= 0.5 and cy <= 0.5
+    if region == "southeast":
+        return cx >= 0.5 and cy >= 0.5
+    if region == "southwest":
+        return cx <= 0.5 and cy >= 0.5
+    return True
+
+
+def select_largest_group(detections: List[Detection], distance_threshold: float = 0.18) -> List[Detection]:
+    """Approximate the biggest object group by clustering nearby box centers."""
+    if not detections:
+        return []
+
+    centers = [box_center(det.bbox) for det in detections]
+    visited = set()
+    clusters: List[List[int]] = []
+
+    for start_idx in range(len(detections)):
+        if start_idx in visited:
+            continue
+
+        stack = [start_idx]
+        visited.add(start_idx)
+        cluster = []
+
+        while stack:
+            idx = stack.pop()
+            cluster.append(idx)
+            cx, cy = centers[idx]
+
+            for other_idx, (ox, oy) in enumerate(centers):
+                if other_idx in visited:
+                    continue
+                if ((cx - ox) ** 2 + (cy - oy) ** 2) ** 0.5 <= distance_threshold:
+                    visited.add(other_idx)
+                    stack.append(other_idx)
+
+        clusters.append(cluster)
+
+    best_cluster = max(
+        clusters,
+        key=lambda cluster: (len(cluster), sum(box_area(detections[i].bbox) for i in cluster)),
+    )
+    return [detections[i] for i in best_cluster]
+
+
+def select_detections_for_question(question: str, detections: List[Detection]) -> List[Detection]:
+    intent = extract_grounding_intent(question)
+    candidates = detections
+
+    if intent.spatial_region:
+        spatial_candidates = [d for d in candidates if detection_in_region(d, intent.spatial_region)]
+        if spatial_candidates:
+            candidates = spatial_candidates
+
+    if intent.selection_mode in {"largest", "main"}:
+        if not candidates:
+            return []
+        return [max(candidates, key=lambda d: (box_area(d.bbox), d.score))]
+
+    if intent.selection_mode == "smallest":
+        if not candidates:
+            return []
+        return [min(candidates, key=lambda d: (box_area(d.bbox), -d.score))]
+
+    if intent.selection_mode == "largest_group":
+        return select_largest_group(candidates)
+
+    if intent.selection_mode == "spatial":
+        return candidates
+
+    return detections
 
 
 @st.cache_resource
@@ -224,7 +387,7 @@ def fallback_router(question: str) -> RouterDecision:
     q = question.lower()
     target_classes = []
 
-    if any(w in q for w in ["building", "house", "apartment", "roof", "residential", "home", "dwelling"]):
+    if any(w in q for w in ["building", "house", "apartment", "roof", "residential", "home", "dwelling", "shed"]):
         target_classes.append("building")
     if any(w in q for w in ["farmland", "farm", "field", "crop", "agricultural"]):
         target_classes.append("farmland")
@@ -253,7 +416,20 @@ def fallback_router(question: str) -> RouterDecision:
             answer_format="json_internal",
         )
 
-    if any(w in q for w in ["where", "location", "which part", "direction", "north", "south", "east", "west"]):
+    if wants_visual:
+        return RouterDecision(
+            task_type="grounding",
+            needs_detection=True,
+            needs_visualization=True,
+            needs_grounding=True,
+            needs_yes_no=False,
+            needs_description=False,
+            target_classes=target_classes,
+            spatial_precision="high",
+            answer_format="json_internal",
+        )
+
+    if any(w in q for w in ["where", "location", "which part", "direction", "north", "south", "east", "west", "left", "right"]):
         return RouterDecision(
             task_type="grounding",
             needs_detection=True,
@@ -339,6 +515,7 @@ def detections_to_context(detections: List[Detection], top_k: int = 20):
             "target_class": det.target_class,
             "bbox": [round(v, 4) for v in det.bbox],
             "score": round(float(det.score), 3),
+            "source": det.source,
         })
     return items
 
@@ -377,7 +554,8 @@ def draw_detections(image: Image.Image, detections: List[Detection], label_mode:
         draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
 
         if label_mode == "short":
-            label = f"{det.target_class}:{det.score:.2f}"
+            source = "vlm" if det.source == "vlm" else f"{det.score:.2f}"
+            label = f"{det.target_class}:{source}"
         else:
             label = det.target_class
 
@@ -392,7 +570,17 @@ def draw_detections(image: Image.Image, detections: List[Detection], label_mode:
 
 
 def choose_target_classes(route: RouterDecision) -> List[str]:
-    return normalize_target_classes(route.target_classes)
+    target_classes = normalize_target_classes(route.target_classes)
+    if target_classes:
+        return target_classes
+
+    # If grounding/visualization is requested without an explicit class
+    # ("show the largest object"), use the fixed ontology as a broad candidate
+    # set rather than silently skipping detection.
+    if route.needs_detection and (route.needs_grounding or route.needs_visualization):
+        return ONTOLOGY
+
+    return []
 
 
 def run_detector_on_image(image: Image.Image, classes: List[str]) -> List[Detection]:
@@ -459,18 +647,33 @@ def summarize_detections(detections: List[Detection]) -> str:
     return " | ".join(f"{cls}: {count}" for cls, count in sorted(counts.items(), key=lambda x: x[0]))
 
 
-def build_detection_context_block(route: RouterDecision, detections: List[Detection]) -> str:
+def build_detection_context_block(
+    route: RouterDecision,
+    detections: List[Detection],
+    selected_detections: List[Detection],
+) -> str:
     payload = {
         "router": route.model_dump(),
+        "detector_use_policy": (
+            "Detector outputs are candidate hints only. They may be wrong and must be "
+            "checked against the image before being used in the final answer."
+        ),
         "detection_summary": summarize_detections(detections),
         "detections": detections_to_context(detections),
+        "selected_detections_for_requested_visualization": detections_to_context(selected_detections),
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-def build_vlm_messages(image: Image.Image, question: str, route: RouterDecision, detections: List[Detection]) -> list:
+def build_vlm_messages(
+    image: Image.Image,
+    question: str,
+    route: RouterDecision,
+    detections: List[Detection],
+    selected_detections: List[Detection],
+) -> list:
     image_b64 = encode_image(image)
-    context = build_detection_context_block(route, detections)
+    context = build_detection_context_block(route, detections, selected_detections)
     system_prompt = build_vlm_system_prompt(route)
 
     user_text = f"""
@@ -487,6 +690,8 @@ Instructions:
 - If the detector is uncertain or noisy, mention approximate language.
 - For counting, give the best final count and mention if it is approximate.
 - For grounding, mention spatial directions if useful.
+- If selected_detections_for_requested_visualization is non-empty, treat it as the app's candidate
+  selection for the requested visual target, but still verify it against the clean image.
 """
 
     return [
@@ -504,14 +709,147 @@ Instructions:
     ]
 
 
-def answer_with_vlm(image: Image.Image, question: str, route: RouterDecision, detections: List[Detection]) -> str:
-    messages = build_vlm_messages(image, question, route, detections)
+def answer_with_vlm(
+    image: Image.Image,
+    question: str,
+    route: RouterDecision,
+    detections: List[Detection],
+    selected_detections: List[Detection],
+) -> str:
+    messages = build_vlm_messages(image, question, route, detections, selected_detections)
     response = completion(
         model="openai/claude-opus-4-7",
         messages=messages,
         max_tokens=600,
     )
     return response.choices[0].message.content.strip()
+
+
+def should_show_boxes(route: RouterDecision) -> bool:
+    return route.needs_visualization or route.needs_grounding or route.task_type in {"grounding", "counting", "mixed"}
+
+
+def extract_json_object(text: str) -> Optional[dict]:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+
+
+def normalize_vlm_bbox(raw_bbox) -> Optional[List[float]]:
+    if not isinstance(raw_bbox, list) or len(raw_bbox) != 4:
+        return None
+    try:
+        bbox = [float(v) for v in raw_bbox]
+    except (TypeError, ValueError):
+        return None
+    if any(v > 1.0 for v in bbox):
+        bbox = [v / 100.0 for v in bbox]
+    x1, y1, x2, y2 = [max(0.0, min(1.0, v)) for v in bbox]
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [x1, y1, x2, y2]
+
+
+def detections_from_vlm_json(payload: Optional[dict]) -> List[Detection]:
+    if not payload:
+        return []
+    raw_boxes = payload.get("boxes", [])
+    if not isinstance(raw_boxes, list):
+        return []
+
+    detections: List[Detection] = []
+    for item in raw_boxes:
+        if not isinstance(item, dict):
+            continue
+        bbox = normalize_vlm_bbox(item.get("bbox"))
+        if bbox is None:
+            continue
+        label = str(item.get("label") or item.get("target_class") or "vlm_target").strip()
+        confidence = item.get("confidence", 0.5)
+        try:
+            score = float(confidence)
+        except (TypeError, ValueError):
+            score = 0.5
+        detections.append(
+            Detection(
+                target_class=label or "vlm_target",
+                bbox=bbox,
+                score=max(0.0, min(1.0, score)),
+                source="vlm",
+            )
+        )
+    return detections
+
+
+def answer_with_vlm_json_grounding(image: Image.Image, question: str, route: RouterDecision, detector_error: Optional[str]) -> dict:
+    image_b64 = encode_image(image)
+    fallback_reason = detector_error or "The detector produced no usable boxes for this request."
+    schema = {
+        "answer": "short natural language answer",
+        "boxes": [
+            {
+                "label": "object or region name",
+                "bbox": [0.0, 0.0, 1.0, 1.0],
+                "confidence": 0.0,
+                "reason": "why this box matches the user request",
+            }
+        ],
+        "notes": "uncertainty or limitations",
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert remote-sensing visual grounding assistant. "
+                "Return only valid JSON. Use the image as primary evidence. "
+                "When drawing is requested and no detector box is available, estimate normalized "
+                "bounding boxes yourself as approximate visual grounding hints, not ground truth."
+            ),
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        f"Question: {question}\n"
+                        f"Router decision: {json.dumps(route.model_dump(), ensure_ascii=False)}\n"
+                        f"Fallback reason: {fallback_reason}\n\n"
+                        "Return JSON matching this schema exactly. Coordinates must be normalized "
+                        "[x1, y1, x2, y2] from 0 to 1 relative to the cropped image. "
+                        "If no reasonable visual target exists, return an empty boxes list.\n"
+                        f"Schema example: {json.dumps(schema, ensure_ascii=False)}"
+                    ),
+                },
+            ],
+        },
+    ]
+    response = completion(
+        model="openai/claude-opus-4-7",
+        messages=messages,
+        max_tokens=800,
+    )
+    raw_text = response.choices[0].message.content.strip()
+    payload = extract_json_object(raw_text)
+    if payload is None:
+        return {"answer": raw_text, "boxes": [], "notes": "The VLM did not return parseable JSON."}
+    return payload
 
 
 # ====================================================
@@ -583,9 +921,17 @@ if uploaded_file is not None:
             st.stop()
 
         route = route_question(question)
+        if detect_visual_intent(question):
+            route.needs_visualization = True
+            route.needs_detection = True
+            route.needs_grounding = True
+            if route.task_type in {"description", "other"}:
+                route.task_type = "grounding"
         crop = original_image.crop(selected_box)
 
         detections: List[Detection] = []
+        selected_detections: List[Detection] = []
+        vlm_json_payload = None
         detector_error = None
 
         if route.needs_detection:
@@ -599,18 +945,36 @@ if uploaded_file is not None:
                     detector_error = str(e)
                     detections = []
 
-        if route.needs_visualization and detections:
-            response_image = draw_detections(crop, detections)
-        else:
-            response_image = crop
+        if detections:
+            selected_detections = select_detections_for_question(question, detections)
 
         with st.spinner("در حال انجام تحلیل"):
             try:
-                answer = answer_with_vlm(response_image, question, route, detections)
+                if should_show_boxes(route) and not selected_detections:
+                    vlm_json_payload = answer_with_vlm_json_grounding(crop, question, route, detector_error)
+                    selected_detections = detections_from_vlm_json(vlm_json_payload)
+                    answer = vlm_json_payload.get("answer", json.dumps(vlm_json_payload, ensure_ascii=False))
+                else:
+                    # Send the clean crop to the VLM so detector overlays remain auxiliary
+                    # visualization, not embedded visual evidence.
+                    answer = answer_with_vlm(crop, question, route, detections, selected_detections)
             except Exception as e:
                 answer = f"API Error: {e}"
 
-        st.image(response_image, caption="ناحیه انتخاب شده", )
+        if should_show_boxes(route) and selected_detections:
+            response_image = draw_detections(crop, selected_detections)
+        else:
+            response_image = crop
+
+        image_col, answer_col = st.columns([1, 1])
+        with image_col:
+            st.image(response_image, caption="ناحیه انتخاب شده")
+        with answer_col:
+            st.subheader("پاسخ")
+            st.write(answer)
+            if vlm_json_payload:
+                st.subheader("VLM JSON grounding")
+                st.json(vlm_json_payload)
 
         with st.expander("Router / Detector debug", expanded=False):
             st.subheader("Router")
@@ -630,5 +994,14 @@ if uploaded_file is not None:
                     for d in detections
                 ])
 
-        st.subheader("پاسخ")
-        st.write(answer)
+            if selected_detections:
+                st.subheader("Selected detections for visualization")
+                st.json([
+                    {
+                        "target_class": d.target_class,
+                        "bbox": [round(v, 4) for v in d.bbox],
+                        "score": round(d.score, 3),
+                        "source": d.source,
+                    }
+                    for d in selected_detections
+                ])
